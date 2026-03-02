@@ -23,10 +23,14 @@ from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.format.pdf.translation_config import WatermarkOutputMode
 from babeldoc.glossary import Glossary
 from babeldoc.translator.translator import OpenAITranslator
+from babeldoc.translator.translator import set_translate_min_interval_override
 from babeldoc.translator.translator import set_translate_rate_limiter
 
 logger = logging.getLogger(__name__)
 __version__ = "0.5.23"
+ZHIPU_DOMAINS = ("bigmodel.cn", "open.bigmodel.cn")
+ZHIPU_SAFE_MAX_QPS = 2
+ZHIPU_MIN_INTERVAL_SECONDS = 2.0
 
 
 def create_parser():
@@ -461,6 +465,7 @@ def create_parser():
 async def main():
     parser = create_parser()
     args: Any = parser.parse_args()
+    effective_qps = args.qps
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -494,6 +499,17 @@ async def main():
 
     if args.enable_process_pool:
         enable_process_pool()
+
+    openai_base_url = (args.openai_base_url or "").lower()
+    if any(domain in openai_base_url for domain in ZHIPU_DOMAINS):
+        effective_qps = min(args.qps, ZHIPU_SAFE_MAX_QPS)
+        if effective_qps != args.qps:
+            logger.warning(
+                "Detected Zhipu API base URL; clamping qps from %s to %s to reduce rate limit errors.",
+                args.qps,
+                effective_qps,
+            )
+            args.qps = effective_qps
 
     # 实例化翻译器
     if args.openai:
@@ -539,7 +555,11 @@ async def main():
         raise ValueError("Invalid translator type")
 
     # 设置翻译速率限制
-    set_translate_rate_limiter(args.qps)
+    set_translate_rate_limiter(effective_qps)
+    if any(domain in openai_base_url for domain in ZHIPU_DOMAINS):
+        set_translate_min_interval_override(ZHIPU_MIN_INTERVAL_SECONDS)
+    else:
+        set_translate_min_interval_override(None)
     # 初始化文档布局模型
     if args.rpc_doclayout:
         from babeldoc.docvision.rpc_doclayout import RpcDocLayoutModel

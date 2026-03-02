@@ -39,6 +39,9 @@ from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
     is_pure_numeric_paragraph,
 )
+from babeldoc.format.pdf.document_il.midend.reference_section import (
+    ReferenceSectionSkipper,
+)
 from babeldoc.format.pdf.document_il.utils.style_helper import GRAY80
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.translator.translator import BaseTranslator
@@ -364,6 +367,7 @@ class ILTranslator:
         self.use_as_fallback = False
         self.add_content_filter_hint_lock = threading.Lock()
         self.docs = None
+        self.reference_section_skipper: ReferenceSectionSkipper | None = None
 
         # Pre-compile patterns for placeholder-like tokens that may be hallucinated by LLM.
         # We only consider the same shapes as our own formula & rich-text placeholders.
@@ -387,6 +391,10 @@ class ILTranslator:
 
     def translate(self, docs: Document):
         self.docs = docs
+        self.reference_section_skipper = ReferenceSectionSkipper(
+            docs,
+            enabled=self.translation_config.skip_reference_section,
+        )
         tracker = DocumentTranslateTracker()
 
         if not self.translation_config.shared_context_cross_split_part.first_paragraph:
@@ -1223,6 +1231,13 @@ class ILTranslator:
         self.translation_config.raise_if_cancelled()
         with PbarContext(pbar):
             try:
+                if (
+                    self.reference_section_skipper
+                    and self.reference_section_skipper.is_reference_paragraph(
+                        page, paragraph
+                    )
+                ):
+                    return
                 if self.use_as_fallback:
                     # il translator llm only modifies unicode in some situations
                     paragraph.unicode = get_paragraph_unicode(paragraph)

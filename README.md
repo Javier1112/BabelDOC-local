@@ -116,6 +116,86 @@ uv run babeldoc --files example.pdf --files example2.pdf --openai --openai-model
 > [!TIP]
 > The absolute path is recommended.
 
+### 中文运行指南（CLI / WebUI）
+
+如果你只想快速跑起来，按下面做即可。
+
+1. 安装（推荐）
+
+```bash
+uv tool install --python 3.12 BabelDOC
+```
+
+2. 命令行运行（CLI）
+
+```bash
+babeldoc \
+  --openai \
+  --openai-model "GLM-4.7-Flash" \
+  --openai-base-url "https://open.bigmodel.cn/api/paas/v4" \
+  --openai-api-key "你的APIKey" \
+  --qps 2 \
+  --files "F:/path/to/example.pdf"
+```
+
+3. 启动本地 WebUI
+
+```bash
+babeldoc-webui
+```
+
+默认访问地址：`http://127.0.0.1:7861`
+
+- 首次启动后，在页面里填写 API 参数并保存。
+- 配置文件会保存到当前工作目录下：`.babeldoc_webui/settings.json`
+- 你也可以用环境变量改监听地址：
+
+```bash
+# Windows PowerShell
+$env:BABELDOC_WEBUI_HOST="0.0.0.0"
+$env:BABELDOC_WEBUI_PORT="7861"
+babeldoc-webui
+```
+
+> [!NOTE]
+> 使用智谱/Open BigModel 时：
+> 1. BabelDOC 会自动发送 `thinking = {"type": "disabled"}`  
+> 2. 运行时会将有效 QPS 保守限制为 `2`（即使你填了更高值）
+
+### 中文运行指南（从源码运行）
+
+如果你是从 Git 仓库拉代码开发或调试，推荐使用 `uv run`：
+
+1. 克隆并进入项目目录
+
+```bash
+git clone https://github.com/funstory-ai/BabelDOC
+cd BabelDOC
+```
+
+2. 使用源码直接运行 CLI
+
+```bash
+uv run babeldoc \
+  --openai \
+  --openai-model "GLM-4.7-Flash" \
+  --openai-base-url "https://open.bigmodel.cn/api/paas/v4" \
+  --openai-api-key "你的APIKey" \
+  --qps 2 \
+  --files "F:/path/to/example.pdf"
+```
+
+3. 使用源码直接运行 WebUI
+
+```bash
+uv run babeldoc-webui
+```
+
+默认访问地址：`http://127.0.0.1:7861`
+
+> [!TIP]
+> `uv run` 会基于当前项目环境解析依赖，适合本地改代码后立即验证行为。
+
 ## Advanced Options
 
 > [!NOTE]
@@ -199,6 +279,9 @@ uv run babeldoc --files example.pdf --files example2.pdf --openai --openai-model
 - `--pool-max-workers`: Maximum number of worker threads for internal task processing pools. If not specified, defaults to QPS value. This parameter directly sets the worker count, replacing previous QPS-based dynamic calculations.
 - `--no-auto-extract-glossary`: Disable automatic term extraction. If this flag is present, the step is skipped. Defaults to enabled.
 
+> [!NOTE]
+> 对于智谱/Open BigModel 接口（例如 `https://open.bigmodel.cn/api/paas/v4`），BabelDOC 会启用保守限速保护，并将运行时生效的 QPS 限制为 `2`，以降低触发速率限制（rate limit）的概率。
+
 > [!TIP]
 >
 > 1. Currently, only OpenAI-compatible LLM is supported. For more translator support, please use [PDFMathTranslate 2.0](https://github.com/PDFMathTranslate/PDFMathTranslate-next).
@@ -213,12 +296,21 @@ uv run babeldoc --files example.pdf --files example2.pdf --openai --openai-model
 - `--openai-base-url`: Base URL for OpenAI API
 - `--openai-api-key`: API key for OpenAI service
 - `--enable-json-mode-if-requested`: Enable JSON mode for OpenAI requests (default: False)
+- `--openai-reasoning`: 在请求体 `reasoning` 字段中发送的推理参数字符串；不设置时不发送该字段。
+- `--openai-term-extraction-reasoning`: 自动术语提取请求使用的推理参数字符串；不设置时不发送该字段。
 - `--term-pool-max-workers`: Maximum number of worker threads dedicated to automatic term extraction. If not specified, this defaults to the value of `--pool-max-workers`, which itself defaults to the QPS value when unset.
 
 > [!TIP]
 >
 > 1. This tool supports any OpenAI-compatible API endpoints. Just set the correct base URL and API key. (e.g. `https://xxx.custom.xxx/v1`)
 > 2. For local models like Ollama, you can use any value as the API key (e.g. `--openai-api-key a`).
+
+> [!NOTE]
+> 对于智谱兼容请求（通过 `open.bigmodel.cn` / `bigmodel.cn` 的 base URL，或 `glm-` 模型前缀识别），BabelDOC 会自动发送：
+>
+> `thinking = {"type": "disabled"}`
+>
+> 即默认关闭 provider 的 thinking 模式，以获得更好的兼容性以及更可控的延迟和成本。
 
 ### Glossary Options
 
@@ -270,7 +362,7 @@ Example Configuration:
 debug = true
 lang-in = "en-US"
 lang-out = "zh-CN"
-qps = 10
+qps = 2  # 智谱/Open BigModel 推荐值，可降低触发速率限制的概率。
 output = "/path/to/output/dir"
 
 # PDF processing options

@@ -13,6 +13,9 @@ from babeldoc.format.pdf.document_il import (
 )
 from babeldoc.format.pdf.document_il import PdfParagraph  # Renamed to avoid conflict
 from babeldoc.format.pdf.document_il.midend.il_translator import Page
+from babeldoc.format.pdf.document_il.midend.reference_section import (
+    ReferenceSectionSkipper,
+)
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import is_cid_paragraph
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
     is_placeholder_only_paragraph,
@@ -150,6 +153,7 @@ class AutomaticTermExtractor:
             raise ValueError(
                 "The provided translate_engine does not support LLM-based translation, which is required for AutomaticTermExtractor."
             )
+        self.reference_section_skipper: ReferenceSectionSkipper | None = None
 
     def calc_token_count(self, text: str) -> int:
         try:
@@ -235,6 +239,12 @@ class AutomaticTermExtractor:
         total_token_count = 0
         for paragraph in page.pdf_paragraph:
             if paragraph.debug_id is None or paragraph.unicode is None:
+                pbar.advance(1)
+                continue
+            if (
+                self.reference_section_skipper
+                and self.reference_section_skipper.is_reference_paragraph(page, paragraph)
+            ):
                 pbar.advance(1)
                 continue
             if is_cid_paragraph(paragraph):
@@ -356,6 +366,10 @@ class AutomaticTermExtractor:
 
     def procress(self, doc_il: ILDocument):
         logger.info(f"{self.stage_name}: Starting term extraction for document.")
+        self.reference_section_skipper = ReferenceSectionSkipper(
+            doc_il,
+            enabled=self.translation_config.skip_reference_section,
+        )
         start_total, start_prompt, start_completion, start_cache_hit_prompt = (
             self._snapshot_token_usage()
         )

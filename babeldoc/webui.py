@@ -16,11 +16,13 @@ from fastapi import Form
 from fastapi import HTTPException
 from fastapi import UploadFile
 from fastapi.responses import HTMLResponse
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from babeldoc.format.pdf.high_level import async_translate
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.translator.translator import OpenAITranslator
+from babeldoc.translator.translator import set_translate_min_interval_override
 from babeldoc.translator.translator import set_translate_rate_limiter
 
 logger = logging.getLogger(__name__)
@@ -30,6 +32,9 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "outputs"
 WORK_DIR = DATA_DIR / "work"
 SETTINGS_FILE = DATA_DIR / "settings.json"
+ZHIPU_DOMAINS = ("bigmodel.cn", "open.bigmodel.cn")
+ZHIPU_SAFE_MAX_QPS = 2
+ZHIPU_MIN_INTERVAL_SECONDS = 2.0
 
 
 def utc_now_iso() -> str:
@@ -42,6 +47,18 @@ def ensure_data_dirs() -> None:
     WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def is_zhipu_base_url(base_url: str) -> bool:
+    normalized = (base_url or "").lower()
+    return any(domain in normalized for domain in ZHIPU_DOMAINS)
+
+
+def get_effective_qps(settings: "AppSettings") -> int:
+    qps = max(1, int(settings.qps))
+    if is_zhipu_base_url(settings.openai_base_url):
+        return min(qps, ZHIPU_SAFE_MAX_QPS)
+    return qps
+
+
 class AppSettings(BaseModel):
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
@@ -49,6 +66,10 @@ class AppSettings(BaseModel):
     lang_in: str = "en"
     lang_out: str = "zh"
     qps: int = 4
+    auto_extract_glossary: bool = False
+    pool_max_workers: int = 1
+    term_pool_max_workers: int = 1
+    skip_reference_section: bool = True
 
 
 @dataclass
@@ -122,6 +143,7 @@ async def run_translation_job(
     pages: str | None,
     no_dual: bool,
     no_mono: bool,
+    output_dir: str | None = None,
 ) -> None:
     job = state.jobs[job_id]
     settings = load_settings()
@@ -143,10 +165,20 @@ async def run_translation_job(
             api_key=settings.openai_api_key,
             ignore_cache=False,
         )
-        set_translate_rate_limiter(settings.qps)
+        effective_qps = get_effective_qps(settings)
+        effective_pool_workers = max(1, int(settings.pool_max_workers))
+        effective_term_pool_workers = max(1, int(settings.term_pool_max_workers))
+        set_translate_rate_limiter(effective_qps)
+        if is_zhipu_base_url(settings.openai_base_url):
+            set_translate_min_interval_override(ZHIPU_MIN_INTERVAL_SECONDS)
+        else:
+            set_translate_min_interval_override(None)
         doc_layout_model = await state.get_doc_layout_model()
 
-        job_output_dir = OUTPUT_DIR / job_id
+        base_output_dir = OUTPUT_DIR
+        if output_dir and output_dir.strip():
+            base_output_dir = Path(output_dir.strip()).expanduser()
+        job_output_dir = base_output_dir / job_id
         job_work_dir = WORK_DIR / job_id
         job_output_dir.mkdir(parents=True, exist_ok=True)
         job_work_dir.mkdir(parents=True, exist_ok=True)
@@ -160,10 +192,14 @@ async def run_translation_job(
             output_dir=job_output_dir,
             working_dir=job_work_dir,
             pages=pages,
-            qps=settings.qps,
+            qps=effective_qps,
             no_dual=no_dual,
             no_mono=no_mono,
             report_interval=0.5,
+            auto_extract_glossary=bool(settings.auto_extract_glossary),
+            pool_max_workers=effective_pool_workers,
+            term_pool_max_workers=effective_term_pool_workers,
+            skip_reference_section=bool(settings.skip_reference_section),
         )
 
         async for event in async_translate(config):
@@ -224,6 +260,14 @@ async def get_settings():
 async def update_settings(settings: AppSettings):
     if settings.qps <= 0:
         raise HTTPException(status_code=400, detail="qps must be > 0")
+    if settings.pool_max_workers <= 0:
+        raise HTTPException(status_code=400, detail="pool_max_workers must be > 0")
+    if settings.term_pool_max_workers <= 0:
+        raise HTTPException(
+            status_code=400, detail="term_pool_max_workers must be > 0"
+        )
+    if is_zhipu_base_url(settings.openai_base_url) and settings.qps > ZHIPU_SAFE_MAX_QPS:
+        settings.qps = ZHIPU_SAFE_MAX_QPS
     save_settings(settings)
     return {"ok": True}
 
@@ -234,6 +278,7 @@ async def create_job(
     pages: str | None = Form(default=None),
     no_dual: bool = Form(default=False),
     no_mono: bool = Form(default=False),
+    output_dir: str | None = Form(default=None),
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="file name is empty")
@@ -253,7 +298,9 @@ async def create_job(
     )
     state.jobs[job_id] = job
 
-    asyncio.create_task(run_translation_job(job_id, pages, no_dual, no_mono))
+    asyncio.create_task(
+        run_translation_job(job_id, pages, no_dual, no_mono, output_dir)
+    )
     return {"job_id": job_id}
 
 
@@ -272,6 +319,11 @@ async def get_job(job_id: str):
     return serialize_job(job)
 
 
+@app.get("/favicon.ico")
+async def favicon():
+    return Response(status_code=204)
+
+
 def cli() -> None:
     import uvicorn
 
@@ -282,7 +334,7 @@ def cli() -> None:
 
 
 INDEX_HTML = """<!doctype html>
-<html lang="zh">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -313,39 +365,44 @@ INDEX_HTML = """<!doctype html>
     <h1>BabelDOC Local WebUI</h1>
 
     <div class="card">
-      <h2>API 配置</h2>
+      <h2>API Settings</h2>
       <div class="grid">
         <div><label>API Key</label><input id="api_key" type="text" /></div>
         <div><label>Base URL</label><input id="base_url" type="text" /></div>
         <div><label>Model</label><input id="model" type="text" /></div>
         <div><label>QPS</label><input id="qps" type="number" min="1" /></div>
-        <div><label>源语言</label><input id="lang_in" type="text" /></div>
-        <div><label>目标语言</label><input id="lang_out" type="text" /></div>
+        <div><label>Auto Extract Glossary</label><input id="auto_extract_glossary" type="checkbox" /></div>
+        <div><label>Pool Workers</label><input id="pool_max_workers" type="number" min="1" /></div>
+        <div><label>Term Pool Workers</label><input id="term_pool_max_workers" type="number" min="1" /></div>
+        <div><label>Skip Reference Section</label><input id="skip_reference_section" type="checkbox" /></div>
+        <div><label>Source Language</label><input id="lang_in" type="text" /></div>
+        <div><label>Target Language</label><input id="lang_out" type="text" /></div>
       </div>
       <div class="row" style="margin-top:10px;">
-        <button id="save_settings">保存配置</button>
+        <button id="save_settings">Save Settings</button>
         <span class="muted" id="settings_msg"></span>
       </div>
     </div>
 
     <div class="card">
-      <h2>创建翻译任务</h2>
+      <h2>Create Translation Job</h2>
       <div class="grid">
-        <div><label>PDF 文件</label><input id="pdf_file" type="file" accept=".pdf" /></div>
-        <div><label>页码（可选，例如 1-3,6）</label><input id="pages" type="text" /></div>
+        <div><label>PDF File</label><input id="pdf_file" type="file" accept=".pdf" /></div>
+        <div><label>Pages (Optional, e.g. 1-3,6)</label><input id="pages" type="text" /></div>
+        <div><label>Output Folder (Optional)</label><input id="output_dir" type="text" placeholder="e.g. F:/translated_output" /></div>
       </div>
       <div class="row" style="margin-top:10px;">
-        <label><input id="no_dual" type="checkbox" /> 不输出双语 PDF</label>
-        <label><input id="no_mono" type="checkbox" /> 不输出单语 PDF</label>
+        <label><input id="no_dual" type="checkbox" /> Disable bilingual PDF</label>
+        <label><input id="no_mono" type="checkbox" /> Disable monolingual PDF</label>
       </div>
       <div class="row" style="margin-top:10px;">
-        <button id="create_job">开始翻译</button>
+        <button id="create_job">Start Translation</button>
         <span class="muted" id="job_msg"></span>
       </div>
     </div>
 
     <div class="card">
-      <h2>任务进度</h2>
+      <h2>Job Progress</h2>
       <div id="jobs"></div>
     </div>
   </div>
@@ -358,6 +415,10 @@ INDEX_HTML = """<!doctype html>
       document.getElementById('base_url').value = s.openai_base_url || '';
       document.getElementById('model').value = s.openai_model || '';
       document.getElementById('qps').value = s.qps || 4;
+      document.getElementById('auto_extract_glossary').checked = Boolean(s.auto_extract_glossary);
+      document.getElementById('pool_max_workers').value = s.pool_max_workers || 1;
+      document.getElementById('term_pool_max_workers').value = s.term_pool_max_workers || 1;
+      document.getElementById('skip_reference_section').checked = s.skip_reference_section !== false;
       document.getElementById('lang_in').value = s.lang_in || 'en';
       document.getElementById('lang_out').value = s.lang_out || 'zh';
     }
@@ -368,6 +429,10 @@ INDEX_HTML = """<!doctype html>
         openai_base_url: document.getElementById('base_url').value.trim(),
         openai_model: document.getElementById('model').value.trim(),
         qps: Number(document.getElementById('qps').value || 4),
+        auto_extract_glossary: document.getElementById('auto_extract_glossary').checked,
+        pool_max_workers: Number(document.getElementById('pool_max_workers').value || 1),
+        term_pool_max_workers: Number(document.getElementById('term_pool_max_workers').value || 1),
+        skip_reference_section: document.getElementById('skip_reference_section').checked,
         lang_in: document.getElementById('lang_in').value.trim() || 'en',
         lang_out: document.getElementById('lang_out').value.trim() || 'zh'
       };
@@ -377,27 +442,27 @@ INDEX_HTML = """<!doctype html>
         body: JSON.stringify(payload)
       });
       const msg = document.getElementById('settings_msg');
-      if (res.ok) msg.textContent = '配置已保存';
-      else msg.textContent = '保存失败';
+      msg.textContent = res.ok ? 'Settings saved.' : 'Save failed.';
     }
 
     async function createJob() {
       const fileInput = document.getElementById('pdf_file');
       const file = fileInput.files[0];
       const msg = document.getElementById('job_msg');
-      if (!file) { msg.textContent = '请先选择 PDF 文件'; return; }
+      if (!file) { msg.textContent = 'Please choose a PDF file first.'; return; }
       const fd = new FormData();
       fd.append('file', file);
       fd.append('pages', document.getElementById('pages').value.trim());
+      fd.append('output_dir', document.getElementById('output_dir').value.trim());
       fd.append('no_dual', document.getElementById('no_dual').checked ? 'true' : 'false');
       fd.append('no_mono', document.getElementById('no_mono').checked ? 'true' : 'false');
       const res = await fetch('/api/jobs', { method: 'POST', body: fd });
       if (res.ok) {
         const data = await res.json();
-        msg.textContent = '任务已创建: ' + data.job_id;
+        msg.textContent = 'Job created: ' + data.job_id;
         fileInput.value = '';
       } else {
-        let err = '创建失败';
+        let err = 'Create failed';
         try { const data = await res.json(); err = data.detail || err; } catch(e) {}
         msg.textContent = err;
       }
@@ -406,7 +471,7 @@ INDEX_HTML = """<!doctype html>
     function renderJobs(items) {
       const container = document.getElementById('jobs');
       if (!items.length) {
-        container.innerHTML = '<div class="muted">暂无任务</div>';
+        container.innerHTML = '<div class="muted">No jobs yet.</div>';
         return;
       }
       container.innerHTML = items.map(j => {
@@ -415,21 +480,28 @@ INDEX_HTML = """<!doctype html>
         return `
           <div class="task">
             <div><strong>${j.file_name}</strong></div>
-            <div class="status">状态: ${j.status}</div>
+            <div class="status">Status: ${j.status}</div>
             <div class="bar"><span style="width:${Math.max(0, Math.min(100, p))}%"></span></div>
-            <div class="muted">总进度: ${p}% | 阶段: ${j.stage || '-'} (${j.stage_current}/${j.stage_total})</div>
-            ${j.error ? `<div class="err">错误: ${j.error}</div>` : ''}
-            ${output ? `<div class="muted">输出: ${output}</div>` : ''}
+            <div class="muted">Progress: ${p}% | Stage: ${j.stage || '-'} (${j.stage_current}/${j.stage_total})</div>
+            ${j.error ? `<div class="err">Error: ${j.error}</div>` : ''}
+            ${output ? `<div class="muted">Output: ${output}</div>` : ''}
           </div>
         `;
       }).join('');
     }
 
+    let loadJobsInFlight = false;
     async function loadJobs() {
-      const res = await fetch('/api/jobs');
-      if (!res.ok) return;
-      const data = await res.json();
-      renderJobs(data.jobs || []);
+      if (loadJobsInFlight) return;
+      loadJobsInFlight = true;
+      try {
+        const res = await fetch('/api/jobs');
+        if (!res.ok) return;
+        const data = await res.json();
+        renderJobs(data.jobs || []);
+      } finally {
+        loadJobsInFlight = false;
+      }
     }
 
     document.getElementById('save_settings').addEventListener('click', saveSettings);
@@ -437,7 +509,7 @@ INDEX_HTML = """<!doctype html>
 
     loadSettings();
     loadJobs();
-    setInterval(loadJobs, 1000);
+    setInterval(loadJobs, 3000);
   </script>
 </body>
 </html>

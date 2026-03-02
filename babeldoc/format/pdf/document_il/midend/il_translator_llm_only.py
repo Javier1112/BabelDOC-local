@@ -22,6 +22,9 @@ from babeldoc.format.pdf.document_il.midend.il_translator import PageTranslateTr
 from babeldoc.format.pdf.document_il.midend.il_translator import (
     ParagraphTranslateTracker,
 )
+from babeldoc.format.pdf.document_il.midend.reference_section import (
+    ReferenceSectionSkipper,
+)
 from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import is_cid_paragraph
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
@@ -149,6 +152,7 @@ class ILTranslatorLLMOnly:
         self.ok_count = 0
         self.fallback_count = 0
         self.total_count = 0
+        self.reference_section_skipper: ReferenceSectionSkipper | None = None
 
     def calc_token_count(self, text: str) -> int:
         try:
@@ -174,6 +178,10 @@ class ILTranslatorLLMOnly:
 
     def translate(self, docs: Document) -> None:
         self.il_translator.docs = docs
+        self.reference_section_skipper = ReferenceSectionSkipper(
+            docs,
+            enabled=self.translation_config.skip_reference_section,
+        )
         tracker = DocumentTranslateTracker()
         self.mid = 0
 
@@ -274,6 +282,7 @@ class ILTranslatorLLMOnly:
         paragraph: PdfParagraph,
         translated_ids: set[int] | None = None,
         require_body_text: bool = False,
+        page: Page | None = None,
     ) -> bool:
         """Check if a paragraph should be translated based on common filtering criteria.
 
@@ -289,6 +298,13 @@ class ILTranslatorLLMOnly:
         if paragraph.debug_id is None or paragraph.unicode is None:
             return False
 
+        if (
+            page is not None
+            and self.reference_section_skipper
+            and self.reference_section_skipper.is_reference_paragraph(page, paragraph)
+        ):
+            return False
+
         # Check if already translated
         if translated_ids is not None and id(paragraph) in translated_ids:
             return False
@@ -299,6 +315,12 @@ class ILTranslatorLLMOnly:
 
         # Minimum length check
         if len(paragraph.unicode) < self.translation_config.min_text_length:
+            return False
+
+        if is_pure_numeric_paragraph(paragraph):
+            return False
+
+        if is_placeholder_only_paragraph(paragraph):
             return False
 
         # Body text check if requested
@@ -327,7 +349,7 @@ class ILTranslatorLLMOnly:
             paragraph
             for paragraph in page.pdf_paragraph
             if self._should_translate_paragraph(
-                paragraph, translated_ids, require_body_text
+                paragraph, translated_ids, require_body_text, page
             )
         ]
 
@@ -546,32 +568,12 @@ class ILTranslatorLLMOnly:
 
         total_token_count = 0
         for paragraph in page.pdf_paragraph:
-            # Check if already translated
-            if id(paragraph) in translated_ids:
-                continue
-
-            # Check basic validation
-            if paragraph.debug_id is None or paragraph.unicode is None:
-                continue
-
-            # Check CID paragraph - advance progress bar if filtered out
-            if is_cid_paragraph(paragraph):
-                if pbar:
-                    pbar.advance(1)
-                continue
-
-            # Check minimum length - advance progress bar if filtered out
-            if len(paragraph.unicode) < self.translation_config.min_text_length:
-                if pbar:
-                    pbar.advance(1)
-                continue
-
-            if is_pure_numeric_paragraph(paragraph):
-                if pbar:
-                    pbar.advance(1)
-                continue
-
-            if is_placeholder_only_paragraph(paragraph):
+            if not self._should_translate_paragraph(
+                paragraph,
+                translated_ids=translated_ids,
+                require_body_text=False,
+                page=page,
+            ):
                 if pbar:
                     pbar.advance(1)
                 continue

@@ -200,6 +200,7 @@ class TranslationConfig:
         metadata_extra_data: str | None = None,
         term_pool_max_workers: int | None = None,
         disable_same_text_fallback: bool = False,
+        skip_reference_section: bool = True,
     ):
         self.translator = translator
         self.term_extraction_translator = term_extraction_translator or translator
@@ -336,6 +337,7 @@ class TranslationConfig:
         self.only_include_translated_page = only_include_translated_page
 
         self.save_auto_extracted_glossary = save_auto_extracted_glossary
+        self.skip_reference_section = skip_reference_section
 
         # force disable table translate until the new model is ready
         self.table_model = None

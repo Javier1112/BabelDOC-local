@@ -36,9 +36,13 @@ class RateLimiter:
             raise ValueError("max_qps must be a positive number")
         self.max_qps = max_qps
         self.min_interval = 1.0 / max_qps
+        self.min_interval_override: float | None = None
         self.lock = threading.Lock()
         # Use monotonic time to prevent issues with system time changes
         self.next_request_time = time.monotonic()
+        # Adaptive cooldown for bursty 429 responses.
+        self.adaptive_backoff_seconds = 0.0
+        self.max_adaptive_backoff_seconds = 60.0
 
     def wait(self, _rate_limit_params: dict = None):
         """
@@ -54,9 +58,10 @@ class RateLimiter:
             # Update the next allowed request time.
             # If the limiter has been idle, the next request should start from 'now'.
             now = time.monotonic()
-            self.next_request_time = (
-                max(self.next_request_time, now) + self.min_interval
-            )
+            interval = self.min_interval
+            if self.min_interval_override is not None:
+                interval = max(interval, self.min_interval_override)
+            self.next_request_time = max(self.next_request_time, now) + interval
 
     def set_max_qps(self, max_qps: int):
         """
@@ -68,12 +73,54 @@ class RateLimiter:
             self.max_qps = max_qps
             self.min_interval = 1.0 / max_qps
 
+    def set_min_interval_override(self, seconds: float | None):
+        with self.lock:
+            if seconds is None:
+                self.min_interval_override = None
+                return
+            if seconds <= 0:
+                raise ValueError("seconds must be a positive number")
+            self.min_interval_override = float(seconds)
+
+    def notify_rate_limited(self, retry_after_seconds: float | None = None):
+        """
+        Push future requests back after a 429 to avoid repeated bursts.
+        """
+        with self.lock:
+            now = time.monotonic()
+            if retry_after_seconds is not None and retry_after_seconds > 0:
+                backoff = float(retry_after_seconds)
+            else:
+                # 1s -> 2s -> 4s ... up to max cap
+                if self.adaptive_backoff_seconds <= 0:
+                    self.adaptive_backoff_seconds = 1.0
+                else:
+                    self.adaptive_backoff_seconds = min(
+                        self.adaptive_backoff_seconds * 2.0,
+                        self.max_adaptive_backoff_seconds,
+                    )
+                backoff = self.adaptive_backoff_seconds
+
+            self.next_request_time = max(self.next_request_time, now + backoff)
+
+    def notify_success(self):
+        with self.lock:
+            # Gradually decay adaptive penalty after successful requests.
+            if self.adaptive_backoff_seconds > 0:
+                self.adaptive_backoff_seconds = max(
+                    0.0, self.adaptive_backoff_seconds / 2.0
+                )
+
 
 _translate_rate_limiter = RateLimiter(5)
 
 
 def set_translate_rate_limiter(max_qps):
     _translate_rate_limiter.set_max_qps(max_qps)
+
+
+def set_translate_min_interval_override(seconds: float | None):
+    _translate_rate_limiter.set_min_interval_override(seconds)
 
 
 class BaseTranslator(ABC):
@@ -203,6 +250,7 @@ class BaseTranslator(ABC):
 class OpenAITranslator(BaseTranslator):
     # https://github.com/openai/openai-python
     name = "openai"
+    ZHIPU_DOMAINS = ("bigmodel.cn", "open.bigmodel.cn")
 
     def __init__(
         self,
@@ -216,6 +264,7 @@ class OpenAITranslator(BaseTranslator):
         send_dashscope_header=False,
         send_temperature=True,
         reasoning=None,
+        disable_thinking_for_zhipu=True,
     ):
         super().__init__(lang_in, lang_out, ignore_cache)
         self.options = {"temperature": 0}  # 随机采样可能会打断公式标记
@@ -226,6 +275,8 @@ class OpenAITranslator(BaseTranslator):
         #     }
         #     self.add_cache_impact_parameters("reasoning-effort", 'minimal')
         self.reasoning = reasoning
+        self.base_url = base_url or ""
+        self.disable_thinking_for_zhipu = disable_thinking_for_zhipu
         self.client = openai.OpenAI(
             base_url=base_url,
             api_key=api_key,
@@ -244,6 +295,9 @@ class OpenAITranslator(BaseTranslator):
         self.send_temperature = send_temperature
         self.add_cache_impact_parameters("model", self.model)
         self.add_cache_impact_parameters("prompt", self.prompt(""))
+        if self.disable_thinking_for_zhipu and self._is_zhipu_request():
+            self.extra_body["thinking"] = {"type": "disabled"}
+            self.add_cache_impact_parameters("thinking", "disabled")
         if self.reasoning:
             self.extra_body["reasoning"] = {"effort": self.reasoning}
             self.add_cache_impact_parameters("reasoning", self.reasoning)
@@ -256,6 +310,13 @@ class OpenAITranslator(BaseTranslator):
         self.completion_token_count = AtomicInteger()
         self.cache_hit_prompt_token_count = AtomicInteger()
 
+    def _is_zhipu_request(self) -> bool:
+        normalized_url = self.base_url.lower()
+        normalized_model = str(self.model).lower()
+        if any(domain in normalized_url for domain in self.ZHIPU_DOMAINS):
+            return True
+        return normalized_model.startswith("glm-")
+
     @retry(
         retry=retry_if_exception_type(openai.RateLimitError),
         stop=stop_after_attempt(100),
@@ -266,15 +327,19 @@ class OpenAITranslator(BaseTranslator):
         options = {}
         if self.send_temperature:
             options.update(self.options)
-
-        response = self.client.chat.completions.create(
-            model=self.model,
-            **options,
-            messages=self.prompt(text),
-            extra_body=self.extra_body,
-        )
-        self.update_token_count(response)
-        return response.choices[0].message.content.strip()
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                **options,
+                messages=self.prompt(text),
+                extra_body=self.extra_body,
+            )
+            self.update_token_count(response)
+            _translate_rate_limiter.notify_success()
+            return response.choices[0].message.content.strip()
+        except openai.RateLimitError as e:
+            _translate_rate_limiter.notify_rate_limited(self._extract_retry_after(e))
+            raise
 
     def prompt(self, text):
         return [
@@ -326,7 +391,11 @@ class OpenAITranslator(BaseTranslator):
                 extra_body=self.extra_body,
             )
             self.update_token_count(response)
+            _translate_rate_limiter.notify_success()
             return response.choices[0].message.content.strip()
+        except openai.RateLimitError as e:
+            _translate_rate_limiter.notify_rate_limited(self._extract_retry_after(e))
+            raise
         except openai.BadRequestError as e:
             if (
                 "系统检测到输入或生成内容可能包含不安全或敏感内容，请您避免输入易产生敏感内容的提示语，感谢您的配合。"
@@ -335,6 +404,20 @@ class OpenAITranslator(BaseTranslator):
                 raise ContentFilterError(e.message) from e
             else:
                 raise
+
+    @staticmethod
+    def _extract_retry_after(error: Exception) -> float | None:
+        response = getattr(error, "response", None)
+        if response is None:
+            return None
+        headers = getattr(response, "headers", None) or {}
+        retry_after = headers.get("retry-after")
+        if retry_after is None:
+            return None
+        try:
+            return float(retry_after)
+        except (TypeError, ValueError):
+            return None
 
     def update_token_count(self, response):
         try:
